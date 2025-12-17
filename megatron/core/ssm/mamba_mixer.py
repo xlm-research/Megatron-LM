@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
@@ -24,6 +25,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -79,9 +81,16 @@ class ExtendedRMSNorm(RMSNormGated):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
+        if not hasattr(self, 'tp_group'):
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -153,6 +162,7 @@ class MambaMixer(MegatronModule):
         headdim=None,
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -174,6 +184,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
@@ -288,9 +299,11 @@ class MambaMixer(MegatronModule):
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+            if self.config.perform_initialization:
+                if self.conv_init is not None:
+                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -309,23 +322,17 @@ class MambaMixer(MegatronModule):
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias = nn.Parameter(inv_dt)
-            # Our initialization would set all Linear.bias to zero,
-            # need to mark this one as _no_reinit
-            self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't
-            # put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            self.dt_bias._no_weight_decay = True
             setattr(self.dt_bias, "tensor_model_parallel", True)
 
             # A parameter
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
+            )
+            if self.config.perform_initialization:
+                A = A.uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
@@ -335,7 +342,6 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
             )
         )  # Keep in fp32
-        self.D._no_weight_decay = True
         setattr(self.D, "tensor_model_parallel", True)
 
         if self.rmsnorm:
@@ -348,6 +354,7 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            setattr(self.norm.weight, "tensor_model_parallel", True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
@@ -382,6 +389,7 @@ class MambaMixer(MegatronModule):
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
         )
+        self.tp_group = pg_collection.tp
 
     def forward(
         self,
@@ -440,7 +448,7 @@ class MambaMixer(MegatronModule):
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         # Fast path: decode-only
         if context.is_decode_only():
@@ -486,7 +494,10 @@ class MambaMixer(MegatronModule):
             zxBCdt_chunked_prefill = zxBCdt[
                 active_token_count - chunked_prefill_request_token_count : active_token_count
             ]
-            batch_index_chunked_prefill = batch_indices[context.chunked_prefill_request_id]
+
+            batch_index_chunked_prefill = batch_indices[
+                context.get_index_of_chunked_prefill_request()
+            ]
 
             y_prefill_chunked = self.ssm_prefill(
                 zxBCdt_chunked_prefill,
@@ -923,6 +934,12 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+
+            # Upcast the batch_indices to prevent integer overflow errors in the case of
+            # large max request counts.
+            if batch_indices is not None:
+                batch_indices = batch_indices.to(torch.int64)
+
             y = selective_state_update(
                 ssm_state,
                 x_reshaped,
@@ -1032,6 +1049,9 @@ class MambaMixer(MegatronModule):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
@@ -1051,12 +1071,17 @@ class MambaMixer(MegatronModule):
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {f"weight": 0, f"bias": 0},
+                    sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
+                    module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=self.tp_group
                 )
 
             sharded_state_dict.update(module_sharded_sd)

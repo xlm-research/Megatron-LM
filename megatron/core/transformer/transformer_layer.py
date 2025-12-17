@@ -272,6 +272,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
@@ -381,11 +382,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     and self.config.cuda_graph_impl == "none"
                 ):
                     self.recompute_input_layernorm = True
-                    if self.config.fp8:
+                    if self.config.fp8 or self.config.fp4:
                         self.self_attention.set_for_recompute_input_layernorm()
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
-                    if self.config.fp8:
+                    if self.config.fp8 or self.config.fp4:
                         if isinstance(self.mlp, MoELayer):
                             self.mlp.set_for_recompute_pre_mlp_layernorm()
                         else:
@@ -585,7 +586,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.recompute_mlp:
-            if self.config.fp8:
+            if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
