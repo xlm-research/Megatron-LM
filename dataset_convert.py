@@ -10,7 +10,7 @@ split = "train"  # "train" / "validation" / "test"
 
 print(f"Loading {dataset_name}/{subset} split={split} ...")
 ds = load_dataset(dataset_name, subset, split=split)
-import pdb; pdb.set_trace()
+
 # 2️⃣ 选择文本字段（不同数据集字段名不一样）
 # 你可以用 print(ds.column_names) 查看
 text_field = "text"

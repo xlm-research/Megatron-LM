@@ -5,6 +5,8 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+torch.profiler._utils._init_for_cuda_graphs()
+
 
 from mamba_builders import mamba_builder
 from megatron.core import mpu
