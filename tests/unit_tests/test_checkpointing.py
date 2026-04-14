@@ -103,6 +103,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
+    args.async_strategy = "mcore"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False
@@ -113,7 +114,6 @@ def create_args():
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
     args.swiglu = True
@@ -143,6 +143,7 @@ def create_ckpt_load_args(create_args):
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
+    args.phase_transition_iterations = None
 
     yield args
 
