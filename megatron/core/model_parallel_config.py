@@ -295,6 +295,11 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    pipeline_shape_comm_separate_group: bool = False
+    """If true, variable-sequence pipeline shape communication uses a dedicated process group
+       instead of sharing the main pipeline-parallel communicator.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.

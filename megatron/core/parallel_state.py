@@ -29,6 +29,8 @@ except ImportError:
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+# Dedicated process group for pipeline shape communication.
+_PIPELINE_MODEL_PARALLEL_SHAPE_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
 _MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra-, pipeline, and expert) that the current rank belongs to.
@@ -1018,6 +1020,10 @@ def initialize_model_parallel(
     assert (
         _PIPELINE_MODEL_PARALLEL_GROUP is None
     ), "pipeline model parallel group is already initialized"
+    global _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP
+    assert (
+        _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP is None
+    ), "pipeline model parallel shape group is already initialized"
     global _EMBEDDING_GROUP
     global _EMBEDDING_GLOBAL_RANKS
     assert _EMBEDDING_GROUP is None, "embedding group is already initialized"
@@ -1104,6 +1110,28 @@ def initialize_model_parallel(
             else:
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
+
+        if ranks == list(ranks):
+            shape_ranks = ranks
+        else:
+            shape_ranks = list(ranks)
+        shape_group = create_group(
+            shape_ranks,
+            timeout=timeout,
+            backend="nccl",
+            pg_options=get_nccl_options("pp", nccl_comm_cfgs),
+            group_desc="PIPELINE_MODEL_PARALLEL_SHAPE_GROUP",
+        )
+        if rank in shape_ranks:
+            if _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP is None:
+                _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP = shape_group
+            elif isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+                _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP.append(shape_group)
+            else:
+                _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP = [
+                    _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP,
+                    shape_group,
+                ]
 
         embedding_ranks = get_embedding_ranks(ranks)
         group = create_group(
@@ -1462,6 +1490,15 @@ def get_pipeline_model_parallel_group(check_initialized=True):
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
         ), "pipeline_model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_pipeline_model_parallel_shape_group(check_initialized=True):
+    """Get the pipeline-model-parallel shape communication group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP is not None
+        ), "pipeline_model parallel shape group is not initialized"
+    return _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP
 
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
@@ -2100,6 +2137,9 @@ def destroy_model_parallel():
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP
+    _PIPELINE_MODEL_PARALLEL_SHAPE_GROUP = None
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None

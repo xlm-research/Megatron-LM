@@ -64,7 +64,7 @@ def _p2p_ops(
 ):
     reqs = {}
     even_send_odd_recv_group = group
-    if group.size() == 2 and torch.distributed.get_backend(group) != 'ucc':
+    if group.size() == 2 and torch.distributed.get_backend(group) == 'nccl':
         # Use the global process group for one of the two p2p communications
         # to allow the overlap of the independent communications.
         # Using the global process group is compatible because the pipeline-parallel
@@ -144,10 +144,16 @@ class P2PCommunicator:
     tensor exchanges between consecutive stages in the pipeline.
     """
 
-    def __init__(self, pp_group: dist.ProcessGroup, config: ModelParallelConfig):
+    def __init__(
+        self,
+        pp_group: dist.ProcessGroup,
+        config: ModelParallelConfig,
+        shape_pp_group: Optional[dist.ProcessGroup] = None,
+    ):
         # Basic attrs
         self.pp_group = pp_group
         self.config = config
+        self.shape_pp_group = shape_pp_group if shape_pp_group is not None else pp_group
 
         world_size = self.pp_group.size()
         curr_rank_in_pg = self.pp_group.rank()
@@ -183,7 +189,17 @@ class P2PCommunicator:
         """Return current pipeline stage index (0-indexed)."""
         return self.pp_group.rank()
 
-    def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
+    def _shape_comm_device(self) -> torch.device:
+        """Return the device used for shape communication tensors."""
+        return (
+            torch.device("cpu")
+            if torch.distributed.get_backend(self.shape_pp_group) == "gloo"
+            else torch.device(torch.cuda.current_device())
+        )
+
+    def _communicate_shapes(
+        self, tensor_send_next, tensor_send_prev, recv_prev, recv_next
+    ):
         """Communicate tensor shapes between stages. Used to communicate
         tensor shapes before the actual tensor communication happens.
         This is required when the sequence lengths across micro batches
@@ -206,61 +222,44 @@ class P2PCommunicator:
         recv_next_shape_tensor = None
         send_prev_shape_tensor = None
         send_next_shape_tensor = None
+        shape_device = self._shape_comm_device()
         if recv_prev:
             recv_prev_shape_tensor = torch.empty(
-                (3,), device=torch.cuda.current_device(), dtype=torch.int64
+                (3,), device=shape_device, dtype=torch.int64
             )
         if recv_next:
             recv_next_shape_tensor = torch.empty(
-                (3,), device=torch.cuda.current_device(), dtype=torch.int64
+                (3,), device=shape_device, dtype=torch.int64
             )
         if tensor_send_prev is not None:
             send_prev_shape_tensor = torch.tensor(
-                tensor_send_prev.size(), device=torch.cuda.current_device(), dtype=torch.int64
+                tensor_send_prev.size(), device=shape_device, dtype=torch.int64
             )
         if tensor_send_next is not None:
             send_next_shape_tensor = torch.tensor(
-                tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
+                tensor_send_next.size(), device=shape_device, dtype=torch.int64
             )
 
-        if config.use_ring_exchange_p2p:
+        if config.use_ring_exchange_p2p and torch.distributed.get_backend(self.shape_pp_group) != "gloo":
             torch.distributed.ring_exchange(
                 tensor_send_prev=send_prev_shape_tensor,
                 tensor_recv_prev=recv_prev_shape_tensor,
                 tensor_send_next=send_next_shape_tensor,
                 tensor_recv_next=recv_next_shape_tensor,
-                group=self.pp_group,
+                group=self.shape_pp_group,
             )
         else:
-            ops = []
-            if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(send_prev_op)
-            if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(recv_prev_op)
-            if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(send_next_op)
-            if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(recv_next_op)
-            if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
-
-            # To protect against race condition when using batch_isend_irecv().
-            # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            reqs = _p2p_ops(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.shape_pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs.values():
+                req.wait()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
