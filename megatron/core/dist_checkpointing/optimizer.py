@@ -95,12 +95,46 @@ def make_sharded_optimizer_tensor(
     """
     optim_param = to_local_if_dtensor(optim_param)
     if isinstance(model_param, ShardedTensorFactory):
-        return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
+        # Only use the factory if the optimizer data has the same shape as
+        # the factory's original data.
+        if tuple(optim_param.shape) == model_param.data.shape:
+            return replace(
+                model_param, key=f'{prefix}.{model_param.key}', data=optim_param
+            )
+        # Shape mismatch: build a plain ShardedTensor from the optimizer param.
+        return ShardedTensor(
+            key=f'{prefix}.{model_param.key}',
+            data=optim_param,
+            dtype=optim_param.dtype,
+            local_shape=tuple(optim_param.shape),
+            global_shape=tuple(optim_param.shape),
+            global_offset=(0,) * optim_param.ndim,
+            axis_fragmentations=(1,) * optim_param.ndim,
+            replica_id=model_param.replica_id,
+            prepend_axis_num=0,
+        )
 
-    assert tuple(optim_param.shape) == model_param.local_shape, (
-        f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape '
-        f'({model_param.local_shape})'
-    )
+    if tuple(optim_param.shape) != model_param.local_shape:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'Shape mismatch for key={model_param.key!r}: '
+            f'optim_param.shape={tuple(optim_param.shape)} != '
+            f'local_shape={model_param.local_shape}. '
+            f'Building standalone ShardedTensor.'
+        )
+        return ShardedTensor(
+            key=f'{prefix}.{model_param.key}',
+            data=optim_param,
+            dtype=optim_param.dtype,
+            local_shape=tuple(optim_param.shape),
+            global_shape=tuple(optim_param.shape),
+            global_offset=(0,) * optim_param.ndim,
+            axis_fragmentations=(1,) * optim_param.ndim,
+            replica_id=model_param.replica_id,
+            prepend_axis_num=0,
+        )
+
     sh_ten = replace(
         model_param, key=f'{prefix}.{model_param.key}', data=optim_param, dtype=optim_param.dtype
     )
@@ -142,7 +176,17 @@ def optim_state_to_sharding_state(
                     id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
                 )
             else:
-                raise ValueError(f'Param id {param_id} does not match any model sharded param')
+                sharded_state[param_id][state_key] = ShardedTensor(
+                    key=f'optimizer.state.{state_key}.{param_id}',
+                    data=param,
+                    dtype=param.dtype,
+                    local_shape=tuple(param.shape),
+                    global_shape=tuple(param.shape),
+                    global_offset=(0,) * param.ndim,
+                    axis_fragmentations=(1,) * param.ndim,
+                    replica_id=0,
+                    prepend_axis_num=0,
+                )
 
     optim_state_dict['param_groups'] = deepcopy(optim_state_dict['param_groups'])
     for group in optim_state_dict['param_groups']:

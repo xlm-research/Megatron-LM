@@ -39,7 +39,7 @@ except ImportError:
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..dist_checkpointing.mapping import ShardedStateDict
+from ..dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
@@ -685,18 +685,25 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.float16_groups = []
             self.fp32_from_float16_groups = []
             self.fp32_from_fp32_groups = []
+            self.model_param_groups_for_optimizer_state = []
+            self.float16_optimizer_param_ids = []
 
             # For all the groups in the original optimizer:
+            optimizer_param_id = 0
             for param_group in self.optimizer.param_groups:
                 float16_params_this_group = []
                 fp32_params_this_group = []
                 fp32_from_float16_params_this_group = []
+                model_params_this_group = []
+                float16_optimizer_param_ids_this_group = []
                 # For all the parameters in this group:
                 for i, param in enumerate(param_group['params']):
                     if param.requires_grad:
+                        model_params_this_group.append(param)
 
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                            float16_optimizer_param_ids_this_group.append(optimizer_param_id)
                             float16_params_this_group.append(param)
                             # Create a copy
                             main_param = param.detach().clone().float()
@@ -728,9 +735,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                 'Received {}'.format(param.type())
                             )
 
+                        optimizer_param_id += 1
+
                 self.float16_groups.append(float16_params_this_group)
                 self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
                 self.fp32_from_fp32_groups.append(fp32_params_this_group)
+                self.model_param_groups_for_optimizer_state.append(model_params_this_group)
+                self.float16_optimizer_param_ids.append(float16_optimizer_param_ids_this_group)
             self.is_stub_optimizer = False
         else:
             self.is_stub_optimizer = True
@@ -838,7 +849,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict = self.state_dict()
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
-            model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
+            model_sharded_state_dict,
+            chain.from_iterable(g for g in self.model_param_groups_for_optimizer_state),
         )
 
         # Convert fp32_from_fp16_params
@@ -847,15 +859,29 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         state_dict['fp32_from_fp16_params'] = [
             [
-                make_sharded_optimizer_tensor(
-                    id_to_sharded_param_map[param_id],
-                    fp32_param,
-                    prefix=f'optimizer.state.fp32_param',
+                (
+                    make_sharded_optimizer_tensor(
+                        id_to_sharded_param_map[param_id],
+                        fp32_param,
+                        prefix='optimizer.state.fp32_param',
+                    )
+                    if param_id in id_to_sharded_param_map
+                    else ShardedTensor(
+                        key=f'optimizer.state.fp32_param.{param_id}',
+                        data=fp32_param,
+                        dtype=fp32_param.dtype,
+                        local_shape=tuple(fp32_param.shape),
+                        global_shape=tuple(fp32_param.shape),
+                        global_offset=(0,) * fp32_param.ndim,
+                        axis_fragmentations=(1,) * fp32_param.ndim,
+                        replica_id=0,
+                        prepend_axis_num=0,
+                    )
                 )
-                for param_id, fp32_param in zip(state_group['params'], fp32_group)
+                for param_id, fp32_param in zip(fp32_param_ids, fp32_group)
             ]
-            for fp32_group, state_group in zip(
-                state_dict['fp32_from_fp16_params'], state_dict['optimizer']['param_groups']
+            for fp32_group, fp32_param_ids in zip(
+                state_dict['fp32_from_fp16_params'], self.float16_optimizer_param_ids
             )
         ]
 
