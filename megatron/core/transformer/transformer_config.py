@@ -200,6 +200,10 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu."""
 
+    activation_func_clamp_shared_expert: bool = True
+    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
+    experts get the clamp."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -262,8 +266,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4']] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4."""
 
     ####################
     # DSA
@@ -283,6 +287,57 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # DeepSeek V4
+    ####################
+    dsv4_mode: bool = False
+    """Enable DeepSeek V4 mode (hybrid CSA/HCA/SWA attention, sqrtsoftplus + hash MoE,
+    Hyper-Connection residual streams)."""
+
+    dsv4_hc_mult: Optional[int] = None
+    """DSV4 Hyper-Connection multiplier (number of HC streams). Hidden state is expanded
+    to [s, b, hc_mult, d] inside the transformer block when dsv4_mode is True."""
+
+    dsv4_hc_sinkhorn_iters: int = 20
+    """DSV4 Hyper-Connection Sinkhorn iteration count for doubly-stochastic normalization."""
+
+    dsv4_hc_eps: float = 1e-6
+    """DSV4 Hyper-Connection epsilon used by hc_split_sinkhorn / hc_head."""
+
+    dsv4_compress_ratios: Optional[List[int]] = None
+    """DSV4 per-layer compression ratios for the KV compressor. ratio == 0 means pure SWA,
+    ratio == 4 means CSA (Compressed Sparse Attention with overlap), ratio == 128 means HCA
+    (Heavily Compressed Attention)."""
+
+    dsv4_compress_rope_theta: float = 40000.0
+    """DSV4 RoPE theta for the compressor's positional encoding. HF V4 ships
+    compress_rope_theta=160000 in the model config."""
+
+    dsv4_o_groups: Optional[int] = None
+    """DSV4 number of output projection groups. Splits the per-head output across groups
+    and applies a low-rank projection (wo_a per-group then wo_b)."""
+
+    dsv4_o_lora_rank: Optional[int] = None
+    """DSV4 LoRA rank for the grouped output projection (wo_a feature dimension)."""
+
+    dsv4_n_hash_layers: int = 0
+    """Number of leading MoE layers that use deterministic hash routing (token_id -> expert)
+    instead of learned routing. Remaining layers use the standard score-based router."""
+
+    dsv4_window_size: int = 4096
+    """Sliding-window size used by DSV4 local attention. HF V4-Pro ships sliding_window=128."""
+
+    vocab_size: Optional[int] = None
+    """Vocabulary size, used for hash routing tid2eid initialization. Populated automatically
+    from the tokenizer when --moe-router-score-function sqrtsoftplus and dsv4_n_hash_layers>0."""
+
+    freeze_e_score_correction_bias: bool = False
+    """Freeze MoE expert-score correction bias during training. Useful when continuing training
+    from a checkpoint where the bias is already balanced and should not be perturbed."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training."""
 
     ####################
     # linear attention
@@ -1115,6 +1170,10 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             pass
+        elif self.experimental_attention_variant == "dsv4":
+            # DSV4 reuses MLA semantics for q_lora / qk-pos-emb but its KV path is built
+            # on a learned Compressor + sliding window cache rather than dsa's indexer.
+            self.dsv4_mode = True
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2261,6 +2320,15 @@ class TransformerConfig(ModelParallelConfig):
                 self.context_parallel_size == 1
             ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
+        if self.experimental_attention_variant == "dsv4":
+            assert self.multi_latent_attention, (
+                "DSV4 attention reuses the multi-latent attention machinery; please set "
+                "--multi-latent-attention together with --experimental-attention-variant dsv4."
+            )
+            assert self.dsv4_hc_mult is not None and self.dsv4_hc_mult > 0, (
+                "dsv4_hc_mult must be a positive integer when experimental_attention_variant=dsv4."
+            )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

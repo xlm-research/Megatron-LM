@@ -450,6 +450,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         layer_offset: int = 0,
     ):
@@ -479,6 +480,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 context_mask,
                 rotary_pos_emb,
                 padding_mask=None,
+                input_ids=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -510,6 +512,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            input_ids=input_ids,
                         )
                 return hidden_states, context
 
@@ -530,6 +533,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    input_ids,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -541,6 +545,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    input_ids,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -584,7 +589,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                        padding_mask, input_ids
                     )
 
                 # Feature extraction: collect hidden states at specified global layer indices
@@ -657,6 +663,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -791,6 +798,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
                 )
@@ -833,6 +841,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            input_ids=input_ids,
                         )
 
                     if (

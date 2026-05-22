@@ -316,7 +316,7 @@ def fused_qk_topk_naive(
     # =========================================
     # Select top-k indices
     # =========================================
-    topk_k = min(index_topk, seqlen)
+    topk_k = min(index_topk, index_scores.size(-1))
     # [batch, seqlen, index_topk]
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 

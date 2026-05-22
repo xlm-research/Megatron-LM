@@ -746,6 +746,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+        # _build_model_and_main_param_groups reorders orig_group["params"] so that
+        # fp32 shards come before fp16/bf16 main-param shards.  This invalidates the
+        # positions cached in model_param_group_index_map (which were built from the
+        # interleaved gbuf order).  Rebuild the mapping so checkpoint save / load
+        # finds the correct optimizer state for each model_param.
+        for group_idx, group_range in enumerate(self.opt_group_ranges):
+            local_idx = 0
+            # fp32 params come first in orig_group["params"].
+            for model_param in group_range["params"]:
+                if model_param.type() == 'torch.cuda.FloatTensor':
+                    self.model_param_group_index_map[model_param] = (group_idx, local_idx)
+                    local_idx += 1
+            # fp16/bf16 params come second.
+            for model_param in group_range["params"]:
+                if model_param.type() in ('torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor'):
+                    self.model_param_group_index_map[model_param] = (group_idx, local_idx)
+                    local_idx += 1
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults

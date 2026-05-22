@@ -434,6 +434,16 @@ class Float16Module(MegatronModule):
         self.vp_stage = getattr(module, 'vp_stage', None)
         self.pg_collection = getattr(module, 'pg_collection', None)
 
+        # DSV4 (and any other model that opts in) tags Hyper-Connection params with
+        # ``param._keep_fp32 = True`` so they survive the global half() / bfloat16()
+        # cast performed below. Snapshot their data here, then restore after the
+        # in-place dtype conversion. We snapshot as float32 to be defensive even if
+        # the upstream code did not explicitly initialize them in fp32.
+        fp32_params = {}
+        for name, param in module.named_parameters():
+            if getattr(param, '_keep_fp32', False):
+                fp32_params[name] = param.data.detach().clone().float()
+
         if self.fp16:
             self.add_module('module', module.half())
 
@@ -448,6 +458,11 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        if fp32_params:
+            for name, param in self.module.named_parameters():
+                if name in fp32_params:
+                    param.data = fp32_params[name]
 
         self.float16_convertor = float16_convertor
 

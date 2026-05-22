@@ -19,16 +19,29 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _reduce(input_, group):
-    """All-reduce the input tensor across model parallel group."""
+def _reduce(input_, group, fp32=False):
+    """All-reduce the input tensor across model parallel group.
+
+    Args:
+        input_: Input tensor.
+        group: Process group for all-reduce.
+        fp32: If True, cast to FP32 before all-reduce, then cast back. Used by
+            DeepSeek-V4 to keep gradient all-reduce numerics in fp32 while the
+            forward path runs in bf16/fp16.
+    """
     assert group is not None, "group should not be None"
 
     # Bypass the function if we are using only 1 GPU.
     if group.size() == 1:
         return input_
 
-    # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    if fp32:
+        orig_dtype = input_.dtype
+        input_fp32 = input_.float().contiguous()
+        torch.distributed.all_reduce(input_fp32, group=group)
+        input_.copy_(input_fp32.to(orig_dtype))
+    else:
+        torch.distributed.all_reduce(input_.contiguous(), group=group)
 
     return input_
 
@@ -75,6 +88,39 @@ def _split_along_first_dim(input_, group):
     output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
 
     return output
+
+
+def split_along_nth_dim(input_, dim, group):
+    """Split the tensor along ``dim`` and keep the slice for the current rank.
+    Pure function (no autograd). Used by DeepSeek-V4 to shard ``input_ids`` along
+    the sequence dimension when sequence parallel is enabled, so that the hash
+    router can index the local slice with hidden states already shaped
+    ``[seq // tp, bsz, ...]``.
+
+    Args:
+        input_: Input tensor to split.
+        dim: The dimension along which to split.
+        group: The process group for splitting.
+
+    Returns:
+        The slice of the input tensor corresponding to the current rank.
+    """
+    assert group is not None, "group should not be None"
+
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+
+    dim_size = input_.size(dim)
+    assert dim_size % world_size == 0, (
+        f"Dimension {dim} of the tensor (size {dim_size}) "
+        f"should be divisible by world size {world_size}"
+    )
+    local_dim_size = dim_size // world_size
+    rank = group.rank()
+    dim_offset = rank * local_dim_size
+
+    return input_.narrow(dim, dim_offset, local_dim_size).contiguous()
 
 
 def _gather_along_last_dim(input_, group):
@@ -198,20 +244,21 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, group):
+    def symbolic(graph, input_, group, all_reduce_grad_fp32):
         """Symbolic function for tracing."""
         return input_
 
     @staticmethod
-    def forward(ctx, input_, group):
+    def forward(ctx, input_, group, all_reduce_grad_fp32):
         """Forward function."""
         ctx.group = group
+        ctx.all_reduce_grad_fp32 = all_reduce_grad_fp32
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _reduce(grad_output, ctx.group), None
+        return _reduce(grad_output, ctx.group, fp32=ctx.all_reduce_grad_fp32), None, None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -485,10 +532,17 @@ class _AllToAll(torch.autograd.Function):
 # -----------------
 
 
-def copy_to_tensor_model_parallel_region(input_, group=None):
-    """Wrapper for autograd function: forward: copy, backward allreduce"""
+def copy_to_tensor_model_parallel_region(input_, group=None, all_reduce_grad_fp32=False):
+    """Wrapper for autograd function: forward: copy, backward allreduce.
+
+    Args:
+        input_: Input tensor.
+        group: Process group for all-reduce. If None, uses default TP group.
+        all_reduce_grad_fp32: If True, cast gradients to FP32 before the backward
+            all-reduce, then cast back. Used by DeepSeek-V4 router gradients.
+    """
     group = get_tensor_model_parallel_group_if_none(group)
-    return _CopyToModelParallelRegion.apply(input_, group)
+    return _CopyToModelParallelRegion.apply(input_, group, all_reduce_grad_fp32)
 
 
 def reduce_from_tensor_model_parallel_region(input_, group=None):
