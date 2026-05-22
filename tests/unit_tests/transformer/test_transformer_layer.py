@@ -11,9 +11,13 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    TransformerConfig,
+    _format_pp_vpp_layer_partition,
+)
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
+    get_num_layers_in_virtual_pipeline_stage,
     get_transformer_layer_offset,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -223,6 +227,27 @@ class TestParallelTransformerLayer:
                     (3, 1): 21,  # Stage 3, VP 1: layers 21-23
                 },
             ),
+            # Test case 5: Non-divisible VPP (26 layers: 7+7+6+6, then 4+3,4+3,3+3,3+3)
+            (
+                {
+                    "num_layers": 26,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": None,
+                    "num_layers_in_last_pipeline_stage": None,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,
+                    (0, 1): 14,
+                    (1, 0): 4,
+                    (1, 1): 17,
+                    (2, 0): 8,
+                    (2, 1): 20,
+                    (3, 0): 11,
+                    (3, 1): 23,
+                },
+            ),
         ],
     )
     def test_get_layer_offset_parametrized(self, config_params, expected_offsets):
@@ -244,7 +269,7 @@ class TestParallelTransformerLayer:
         )
 
         for (pipeline_rank, vp_stage), expected_offset in expected_offsets.items():
-            original_get_pipeline_rank = parallel_state.get_pipeline_model_parallel_rank
+            original_pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
             parallel_state.set_pipeline_model_parallel_rank(pipeline_rank)
 
             try:
@@ -254,7 +279,43 @@ class TestParallelTransformerLayer:
                     f"VP stage {vp_stage}, but got {actual_offset}"
                 )
             finally:
-                parallel_state.set_pipeline_model_parallel_rank(original_get_pipeline_rank)
+                parallel_state.set_pipeline_model_parallel_rank(original_pipeline_rank)
+
+    def test_non_divisible_vpp_partition_logging(self):
+        config = TransformerConfig(
+            num_layers=24,
+            pipeline_model_parallel_size=4,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            hidden_size=512,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+        )
+
+        assert get_num_layers_in_virtual_pipeline_stage(config, vp_stage=0, pp_rank=0) == 3
+        assert get_num_layers_in_virtual_pipeline_stage(config, vp_stage=1, pp_rank=0) == 3
+        assert get_transformer_layer_offset(config, vp_stage=1, pp_rank=0) == 12
+
+        partition_log = _format_pp_vpp_layer_partition(config)
+        assert "pp0: 6 layers -> vpp0: 3 layers [1-3]" in partition_log
+        assert "vpp1: 3 layers [4-6] (global layer ids [13-15])" in partition_log
+
+        non_divisible_config = TransformerConfig(
+            num_layers=26,
+            pipeline_model_parallel_size=4,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            hidden_size=512,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+        )
+
+        assert get_num_layers_in_virtual_pipeline_stage(
+            non_divisible_config, vp_stage=0, pp_rank=0
+        ) == 4
+        assert get_num_layers_in_virtual_pipeline_stage(
+            non_divisible_config, vp_stage=1, pp_rank=0
+        ) == 3
 
     @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])

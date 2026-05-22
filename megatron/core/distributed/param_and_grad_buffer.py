@@ -1484,7 +1484,7 @@ def partition_buckets(
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
-        buckets = []
+        dtype_to_buckets = {}
         ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
@@ -1492,12 +1492,15 @@ def partition_buckets(
             assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
+            for bucket in buffer.buckets:
+                dtype_to_buckets.setdefault(bucket.grad_data.dtype, []).append(bucket)
 
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
+        return [
+            _ParamAndGradBucketGroup(
+                buckets, ddp_config, data_parallel_group, data_parallel_world_size
+            )
+            for buckets in dtype_to_buckets.values()
+        ]
 
     if torch.uint8 not in dtype_to_buffer_map:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
