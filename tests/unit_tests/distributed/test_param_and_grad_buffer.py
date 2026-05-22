@@ -98,6 +98,51 @@ def get_model_and_buffers(
     return model, param_and_grad_buffer, bucket_groups
 
 
+class TestPartitionBuckets:
+
+    def test_force_single_bucket_group_keeps_grad_dtypes_separate(self):
+        """force_single_bucket_group should not mix tensors with different dtypes.
+
+        torch.distributed._coalescing_manager ultimately calls allreduce_coalesced, which
+        requires all tensors in one coalesced op to have the same dtype.
+        """
+
+        class FakeBucket:
+            def __init__(self, grad_dtype):
+                self.params_list = []
+                self.params = set()
+                self.grad_data = torch.zeros(1, dtype=grad_dtype)
+
+        class FakeBuffer:
+            def __init__(self, param_dtype, grad_dtype, num_buckets, data_parallel_group):
+                self.param_dtype = param_dtype
+                self.ddp_config = DistributedDataParallelConfig()
+                self.data_parallel_group = data_parallel_group
+                self.data_parallel_world_size = 8
+                self.buckets = [FakeBucket(grad_dtype) for _ in range(num_buckets)]
+
+        data_parallel_group = object()
+        buffers = [
+            FakeBuffer(torch.bfloat16, torch.bfloat16, 2, data_parallel_group),
+            FakeBuffer(torch.float32, torch.bfloat16, 1, data_parallel_group),
+            FakeBuffer(torch.float64, torch.float32, 1, data_parallel_group),
+        ]
+        bucket_groups = partition_buckets(buffers, force_single_bucket_group=True)
+
+        assert len(bucket_groups) == 2
+        dtype_to_bucket_count = {}
+        for bucket_group in bucket_groups:
+            grad_dtypes = {bucket.grad_data.dtype for bucket in bucket_group.buckets}
+            assert len(grad_dtypes) == 1
+            grad_dtype = next(iter(grad_dtypes))
+            dtype_to_bucket_count[grad_dtype] = dtype_to_bucket_count.get(grad_dtype, 0) + len(
+                bucket_group.buckets
+            )
+
+        assert dtype_to_bucket_count[torch.bfloat16] == 3
+        assert dtype_to_bucket_count[torch.float32] == 1
+
+
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
