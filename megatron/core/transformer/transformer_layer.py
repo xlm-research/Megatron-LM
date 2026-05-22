@@ -789,6 +789,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.recompute_mlp:
+            mlp_kwargs = {"padding_mask": padding_mask}
+            if self.is_moe_layer and input_ids is not None:
+                mlp_kwargs["input_ids"] = input_ids
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -799,11 +802,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
+                    **mlp_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
+                    functools.partial(self.mlp, **mlp_kwargs),
                     False,
                     pre_mlp_layernorm_output,
                 )

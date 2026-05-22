@@ -239,8 +239,9 @@ class MoELayer(BaseMoELayer):
             config=self.config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
-            layer_number=layer_number,
         )
+        if self.layer_number is not None:
+            self.router.set_layer_number(self.layer_number)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -438,6 +439,10 @@ class MoELayer(BaseMoELayer):
             input_ids = split_along_nth_dim(
                 input_ids, dim=1, group=parallel_state.get_tensor_model_parallel_group()
             )
+        if input_ids is not None and getattr(self.config, "dsv4_mode", False):
+            # Hidden states are [s, b, h] and router logits flatten in sequence-major order.
+            # Input ids arrive from the dataloader as [b, s], so align them before flattening.
+            input_ids = input_ids.transpose(0, 1).contiguous()
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids
         )
@@ -654,10 +659,11 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
+                    input_ids,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask, input_ids
                 )
         else:
             outputs = custom_forward(
