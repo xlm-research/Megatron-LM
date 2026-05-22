@@ -1065,7 +1065,15 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    if getattr(config, "dsv4_mode", False):
+        tensor_shape = [
+            seq_length,
+            micro_batch_size,
+            config.dsv4_hc_mult,
+            config.hidden_size,
+        ]
+    else:
+        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2028,7 +2036,12 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    if getattr(config, "dsv4_mode", False):
+        tensor_shapes.append(
+            (effective_seq_length, micro_batch_size, config.dsv4_hc_mult, config.hidden_size)
+        )
+    else:
+        tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
 

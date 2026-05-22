@@ -34,6 +34,7 @@ class Router(ABC, MegatronModule):
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
     ) -> None:
         """
         Initialize the Router module.
@@ -42,12 +43,14 @@ class Router(ABC, MegatronModule):
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            layer_number (int, optional): The 1-indexed layer number this router lives in.
+                Used by DSV4 to decide between hash routing (early layers) and learned routing.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
-        self.layer_number = None
+        self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
@@ -69,6 +72,15 @@ class Router(ABC, MegatronModule):
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
+
+        # DSV4 lets the user freeze the router gate weights (and bias) — useful when
+        # the routing matrix is loaded from a pretrained checkpoint and we don't want
+        # SFT to perturb it. The freeze flag is also re-checked in gating() so that
+        # any later code that re-enables grad accidentally doesn't slip through.
+        if getattr(self.config, "moe_router_freeze_gate", False):
+            self.weight.requires_grad = False
+            if self.bias is not None:
+                self.bias.requires_grad = False
 
     def reset_parameters(self):
         """Reset the router parameters."""
@@ -96,6 +108,14 @@ class Router(ABC, MegatronModule):
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
+        if getattr(self.config, "moe_router_freeze_gate", False):
+            assert not self.weight.requires_grad, (
+                "moe_router_freeze_gate is set but router weight has requires_grad=True; "
+                "an external optimizer wrapper has re-enabled the gradient."
+            )
+            if self.bias is not None:
+                assert not self.bias.requires_grad
 
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
@@ -155,6 +175,7 @@ class TopKRouter(Router):
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -162,35 +183,32 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            layer_number (int, optional): The 1-indexed layer number for this router.
+                Used by DSV4 to choose between hash routing and learned routing.
         """
-        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+        )
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
 
-        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
-        if self.enable_expert_bias:
-            self.register_buffer(
-                'local_tokens_per_expert',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                'expert_bias',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-            )
-        else:
-            self.local_tokens_per_expert = None
-            self.expert_bias = None
+        # Whether to use deterministic hash routing (token id -> expert id) for this layer.
+        # In DSV4 the first ``dsv4_n_hash_layers`` MoE layers use hash routing; expert_bias
+        # is therefore disabled on those layers. The decision needs ``layer_number``,
+        # which Megatron's MoELayer now passes through; if it isn't available yet we
+        # defer the decision to ``set_layer_number``.
+        self._routing_mode_initialized = False
+        self.enable_expert_bias = False
+        self.tid2eid = None
+        self._frozen_expert_bias_snapshot = None
+
+        if layer_number is not None:
+            self._init_routing_mode(layer_number)
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -215,6 +233,73 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+
+    def _init_routing_mode(self, layer_number: int):
+        """Decide between expert_bias-based learned routing and DSV4 hash routing.
+
+        DSV4 routes the first ``dsv4_n_hash_layers`` MoE layers via a frozen
+        ``tid2eid`` lookup (token id -> top-k expert ids). The expert-bias buffer
+        is suppressed on those layers because the routing is fully deterministic.
+        Remaining layers fall back to standard sigmoid/sqrtsoftplus routing with
+        an aux-loss-free expert-score correction bias.
+        """
+        assert not self._routing_mode_initialized
+        self._routing_mode_initialized = True
+
+        dsv4_mode = getattr(self.config, "dsv4_mode", False)
+        n_hash_layers = getattr(self.config, "dsv4_n_hash_layers", 0)
+        # ``layer_number`` is 1-indexed in Megatron, while the HF V4 reference uses
+        # 0-indexed (``layer_id < args.n_hash_layers``). Use the same semantic here.
+        mode_hash = dsv4_mode and (layer_number - 1) < n_hash_layers
+
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not mode_hash
+        )
+        if self.enable_expert_bias:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+
+        if mode_hash:
+            vocab_size = getattr(self.config, "vocab_size", None)
+            assert vocab_size is not None, (
+                "DSV4 hash routing requires --vocab-size to be populated on the "
+                "TransformerConfig (normally derived from the tokenizer)."
+            )
+            # tid2eid is a non-trainable lookup buffer; we model it as a Parameter
+            # with requires_grad=False so it serializes naturally with the rest of
+            # the router state, mirroring the HF reference.
+            self.tid2eid = torch.nn.Parameter(
+                torch.full(
+                    (vocab_size, self.topk),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+
+    def set_layer_number(self, layer_number: int):
+        """Late-binding hook: Megatron sets layer_number after build_module returns."""
+        self.layer_number = layer_number
+        if not self._routing_mode_initialized:
+            self._init_routing_mode(layer_number)
 
     def _maintain_float32_expert_bias(self):
         """
@@ -584,7 +669,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -592,12 +682,20 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            input_ids (torch.Tensor, optional): Input token IDs, only consumed by hash-routed
+                                                DSV4 layers (where ``tid2eid`` is initialized).
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        if getattr(self.config, "dsv4_mode", False):
+            assert self._routing_mode_initialized, (
+                "DSV4 routing mode (hash vs learned) was not initialized; "
+                "MoELayer must propagate layer_number into the router."
+            )
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
@@ -623,6 +721,12 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                tid2eid=self.tid2eid,
+                input_ids=(
+                    input_ids.view(-1)
+                    if self.tid2eid is not None and input_ids is not None
+                    else None
+                ),
             )
 
         # Apply token dropping to probs and routing_map.
@@ -678,7 +782,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -687,8 +796,24 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            input_ids (torch.Tensor, optional): Token IDs for DSV4 hash routing.
         """
         self._maintain_float32_expert_bias()
+
+        # If freeze_e_score_correction_bias is set, sanity check that nothing else
+        # mutated the bias between iterations. Using clone() (not a view) guards
+        # against in-place updates from optimizer states.
+        if (
+            getattr(self.config, "freeze_e_score_correction_bias", False)
+            and self.enable_expert_bias
+            and self.expert_bias is not None
+        ):
+            if self._frozen_expert_bias_snapshot is None:
+                self._frozen_expert_bias_snapshot = self.expert_bias.detach().clone()
+            else:
+                assert torch.equal(
+                    self.expert_bias, self._frozen_expert_bias_snapshot
+                ), "expert_bias was modified but freeze_e_score_correction_bias is enabled."
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
@@ -704,7 +829,9 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, input_ids=input_ids
+        )
 
         return probs, routing_map
 
@@ -736,12 +863,16 @@ class InferenceTopKRouter(TopKRouter):
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            is_mtp_layer (bool): Whether this router is part of an MTP layer.
+            layer_number (int, optional): Forwarded to TopKRouter for parity; the
+                inference router never enables DSV4 hash routing.
         """
         # Enforce constraints before calling super().__init__
         assert config.moe_router_num_groups is None, (
@@ -753,7 +884,12 @@ class InferenceTopKRouter(TopKRouter):
             f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
         )
 
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+        )
 
         self.is_inference_cuda_graphed_iteration = False
 
@@ -812,12 +948,19 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            input_ids (torch.Tensor, optional): Not used in inference; accepted for
+                signature parity with the training-path TopKRouter.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -826,6 +969,6 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if self.training or not self.is_inference_cuda_graphed_iteration:
-            return super().forward(input, padding_mask)
+            return super().forward(input, padding_mask, input_ids=input_ids)
 
         return self._forward(input, padding_mask)

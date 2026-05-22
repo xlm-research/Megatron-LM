@@ -684,6 +684,8 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    tid2eid: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -805,7 +807,25 @@ def topk_routing_with_score_function(
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
+        if tid2eid is not None:
+            # DSV4 hash routing: token id -> expert ids, deterministic across all
+            # ranks. We bypass top-k entirely and gather the routed scores from the
+            # tid2eid lookup. This requires ``input_ids`` shaped [num_tokens] to
+            # match ``logits`` along dim=0.
+            assert (
+                input_ids is not None
+            ), "tid2eid is set but input_ids was not provided to the router."
+            assert not tid2eid.requires_grad, "tid2eid must be a frozen lookup."
+            assert (
+                input_ids.shape[0] == scores.shape[0]
+            ), f"input_ids ({input_ids.shape}) must match logits dim=0 ({scores.shape})."
+            top_indices = tid2eid[input_ids.long()].long()
+            assert torch.all(top_indices >= 0), (
+                "tid2eid contains the sentinel value -1 for some token id; "
+                "did you forget to load the routing table from the checkpoint?"
+            )
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        elif expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices)

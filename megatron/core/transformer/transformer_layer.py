@@ -699,12 +699,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
+        ``input_ids`` is consumed only by hash-routed DSV4 MoE layers; other layers
+        ignore it.
         """
+        # ``input_ids`` is forwarded by TransformerBlock for DSV4 hash routing but
+        # is not part of the attention signature; pop it before the attention call
+        # and feed it into the MLP path explicitly.
+        input_ids = kwargs.pop("input_ids", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            input_ids=input_ids,
         )
         return output, context
 
@@ -730,6 +737,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        input_ids: Tensor | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -742,6 +750,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
+            input_ids (Tensor, optional): Input token IDs forwarded only when this is a
+                DSV4 hash-routed MoE layer. Other layers must ignore it.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -815,7 +825,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            # Only an MoE-typed MLP knows how to consume input_ids; pass it conditionally
+            # so dense FFNs (and non-DSV4 MoE) keep their existing call signature.
+            mlp_kwargs = {"padding_mask": padding_mask}
+            if self.is_moe_layer and input_ids is not None:
+                mlp_kwargs["input_ids"] = input_ids
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, **mlp_kwargs)
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1463,12 +1478,14 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None, input_ids=None):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
         If `use_partial_cudagraphs` is True, this method stitches together the
-        router, expert_compute, and postprocess calls.
+        router, expert_compute, and postprocess calls. ``input_ids`` is forwarded
+        to the underlying TopKRouter only when DSV4 hash routing is active. Partial
+        cudagraphs path does not support DSV4 hash routing and asserts on it.
         """
 
         if inference_context is not None:
@@ -1523,4 +1540,6 @@ class MoETransformerLayer(TransformerLayer):
             else:
                 return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
-            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+            return super()._forward_mlp(
+                hidden_states, padding_mask=padding_mask, input_ids=input_ids
+            )
