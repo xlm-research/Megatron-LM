@@ -686,6 +686,7 @@ def topk_routing_with_score_function(
     dense_output: bool = False,
     tid2eid: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    router_layer_number: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -820,10 +821,21 @@ def topk_routing_with_score_function(
                 input_ids.shape[0] == scores.shape[0]
             ), f"input_ids ({input_ids.shape}) must match logits dim=0 ({scores.shape})."
             top_indices = tid2eid[input_ids.long()].long()
-            assert torch.all(top_indices >= 0), (
-                "tid2eid contains the sentinel value -1 for some token id; "
-                "did you forget to load the routing table from the checkpoint?"
-            )
+            if not torch.all(top_indices >= 0):
+                invalid_mask = top_indices < 0
+                bad_token_ids = input_ids[invalid_mask.any(dim=-1)]
+                bad_token_preview = bad_token_ids[:16].detach().cpu().tolist()
+                tid2eid_min = int(tid2eid.min().detach().cpu().item())
+                tid2eid_max = int(tid2eid.max().detach().cpu().item())
+                raise AssertionError(
+                    "tid2eid contains the sentinel value -1 for some token id; "
+                    "did you forget to load the routing table from the checkpoint? "
+                    f"layer_number={router_layer_number}, "
+                    f"num_bad_tokens={bad_token_ids.numel()}, "
+                    f"bad_token_ids_preview={bad_token_preview}, "
+                    f"tid2eid_min={tid2eid_min}, tid2eid_max={tid2eid_max}, "
+                    f"tid2eid_shape={tuple(tid2eid.shape)}"
+                )
             scores = torch.gather(scores, dim=1, index=top_indices)
         elif expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()

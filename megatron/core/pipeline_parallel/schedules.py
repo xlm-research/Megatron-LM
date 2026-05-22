@@ -31,6 +31,7 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
+    make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -185,6 +186,22 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
+
+
+def make_viewless_output_tensor(out):
+    """Make tensors returned by forward_step safe for pipeline pseudo-deallocation."""
+    if out is None:
+        return None
+    if isinstance(out, torch.Tensor):
+        return make_viewless_tensor(
+            inp=out, requires_grad=out.requires_grad, keep_graph=True)
+    if isinstance(out, list):
+        return [make_viewless_output_tensor(item) for item in out]
+    if isinstance(out, tuple):
+        return tuple(make_viewless_output_tensor(item) for item in out)
+    if isinstance(out, dict):
+        return {key: make_viewless_output_tensor(value) for key, value in out.items()}
+    return out
 
 
 def custom_backward(output, grad_output):
@@ -451,6 +468,7 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+    output_tensor = make_viewless_output_tensor(output_tensor)
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens

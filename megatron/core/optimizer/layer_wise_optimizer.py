@@ -177,7 +177,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     else:
                         # dp_cp_size == 1: single rank owns all params, no
                         # all-gather needed but data structures must be initialized.
-                        bucket_params_list = [list(bucket.params)]
+                        bucket_params_list = [list(bucket.params_list)]
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:

@@ -727,6 +727,7 @@ class TopKRouter(Router):
                     if self.tid2eid is not None and input_ids is not None
                     else None
                 ),
+                router_layer_number=self.layer_number,
             )
 
         # Apply token dropping to probs and routing_map.
