@@ -443,6 +443,10 @@ class Float16Module(MegatronModule):
         for name, param in module.named_parameters():
             if getattr(param, '_keep_fp32', False):
                 fp32_params[name] = param.data.detach().clone().float()
+        fp32_buffers = {}
+        for name, buffer in module.named_buffers():
+            if getattr(buffer, '_keep_fp32', False):
+                fp32_buffers[name] = buffer.detach().clone().float()
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -463,6 +467,10 @@ class Float16Module(MegatronModule):
             for name, param in self.module.named_parameters():
                 if name in fp32_params:
                     param.data = fp32_params[name]
+        if fp32_buffers:
+            for name, buffer in self.module.named_buffers():
+                if name in fp32_buffers:
+                    buffer.data = fp32_buffers[name]
 
         self.float16_convertor = float16_convertor
 

@@ -273,6 +273,7 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            self.expert_bias._keep_fp32 = True
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
